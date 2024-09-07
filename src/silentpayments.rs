@@ -398,17 +398,17 @@ impl fmt::Display for OutputScanError {
 }
 
 /// Scan for Silent Payment transaction outputs.
-pub fn silentpayments_recipient_scan_outputs<C: Verification, L>(
+pub fn silentpayments_recipient_scan_outputs<
+    C: Verification,
+    F: FnMut(&[u8; 33]) -> Option<[u8; 32]>,
+>(
     secp: &Secp256k1<C>,
     tx_outputs: &[&XOnlyPublicKey],
     recipient_scan_key: &SecretKey,
     public_data: &SilentpaymentsPublicData,
     recipient_spend_pubkey: &PublicKey,
-    label_lookup: SilentpaymentsLabelLookupFunction,
-    label_context: L,
-) -> Result<Vec<SilentpaymentsFoundOutput>, OutputScanError>
-{
-
+    label_lookup: Option<F>,
+) -> Result<Vec<SilentpaymentsFoundOutput>, OutputScanError> {
     let cx = secp.ctx().as_ptr();
 
     let n_tx_outputs = tx_outputs.len();
@@ -418,8 +418,59 @@ pub fn silentpayments_recipient_scan_outputs<C: Verification, L>(
 
     let mut n_found_outputs: usize = 0;
 
-    let res = unsafe {
+    type Context<F> = (F, [u8; 32]);
+    // must live for as long as the c function `secp256k1_silentpayments_recipient_scan_outputs`
+    let mut context: Context<F>;
+    let (label_lookup, label_context): (SilentpaymentsLabelLookupFunction, _) =
+        if let Some(label_lookup) = label_lookup {
+            unsafe extern "C" fn callback<F: FnMut(&[u8; 33]) -> Option<[u8; 32]>>(
+                label33: *const u8,
+                label_context: *const c_void,
+            ) -> *const u8 {
+                let label33 = unsafe { &*label33.cast::<[u8; 33]>() };
+                // `.cast_mut()` requires slightly higher (1.65) msrv :(, using `as` instead.
+                let (f, storage) =
+                    unsafe { &mut *(label_context as *mut c_void).cast::<Context<F>>() };
 
+                // `catch_unwind` is needed on Rust < 1.81 to prevent unwinding across an ffi
+                // boundary, which is undefined behavior. When the user supplied function panics,
+                // we abort the process. This behavior is consistent with Rust >= 1.81.
+                match std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| f(label33))) {
+                    Ok(Some(tweak)) => {
+                        // We can't return a pointer to `tweak` as that lives in this function's
+                        // (the callback) stack frame, `storage`, on the other hand, remains valid
+                        // for the duration of secp256k1_silentpayments_recipient_scan_outputs.
+                        *storage = tweak;
+                        storage.as_ptr()
+                    }
+                    Ok(None) => core::ptr::null(),
+                    Err(_) => {
+                        std::process::abort();
+                    }
+                }
+            }
+
+            context = (label_lookup, [0; 32]);
+
+            (callback::<F>, &mut context as *mut Context<F> as *const c_void)
+        } else {
+            // TODO we actually want a null pointer, but secp256k1-sys does not allow that (why?).
+            // A noop is equivalent to null here, but secp256k1 has to do a bit of extra work.
+            unsafe extern "C" fn noop(
+                _label33: *const u8,
+                _label_context: *const c_void,
+            ) -> *const u8 {
+                core::ptr::null()
+            }
+
+            // TODO `label_context` may be null iff `label_lookup` is null, I requested to remove
+            // that requirement.
+            // See https://github.com/bitcoin-core/secp256k1/pull/1519#discussion_r1748595895
+            (noop, 1usize as *const c_void)
+            // (core::ptr::null(), core::ptr::null())
+        };
+
+    let res = unsafe {
         let ffi_tx_outputs: &[*const ffi::XOnlyPublicKey] = transmute::<&[&XOnlyPublicKey], &[*const ffi::XOnlyPublicKey]>(tx_outputs);
 
         secp256k1_silentpayments_recipient_scan_outputs(
@@ -432,7 +483,7 @@ pub fn silentpayments_recipient_scan_outputs<C: Verification, L>(
             public_data.as_c_ptr(),
             recipient_spend_pubkey.as_c_ptr(),
             label_lookup,
-            &label_context as *const L as *const c_void,
+            label_context,
         )
     };
 
